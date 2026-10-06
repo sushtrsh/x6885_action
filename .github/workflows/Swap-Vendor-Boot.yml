@@ -1,0 +1,145 @@
+name: Swap Vendor Boot (X6885)
+
+# Takes the recovery ramdisk fragment from the Fox-built vendor_boot.img and swaps it into the
+# STOCK vendor_boot.img (everything else stays byte-identical), then publishes the result.
+# Nothing here signs, patches vbmeta or disables verification.
+
+on:
+  workflow_dispatch:
+    inputs:
+      FOX_RELEASE_TAG:
+        description: 'Release tag (in THIS repo) that holds the Fox-built vendor_boot.img (e.g. 37392546400)'
+        required: true
+      STOCK_RELEASE_TAG:
+        description: 'Release tag (in THIS repo) that holds the STOCK vendor_boot.img'
+        required: true
+        default: 'stock-vendor-boot'
+      STOCK_ASSET_NAME:
+        description: 'File name of the stock image inside that release'
+        required: true
+        default: 'vendor_boot_STOCK_X6885_backup.img'
+      STOCK_SHA256:
+        description: 'Expected sha256 of the stock image (empty = skip check)'
+        required: false
+        default: '2349318a9c6b112cdf30d8eb047e7ae51e0f367e0f73582d5a5ebee6129d62f9'
+      DEVICE_TREE:
+        description: 'Device tree repo that contains tools/make_vendor_boot.py'
+        required: true
+        default: 'https://github.com/stephenchaw525-spec/Test'
+      DEVICE_TREE_BRANCH:
+        description: 'Device tree branch'
+        required: true
+        default: 'main'
+
+jobs:
+  swap:
+    name: Swap recovery fragment into stock vendor_boot
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FOX_TAG: ${{ inputs.FOX_RELEASE_TAG }}
+      STOCK_TAG: ${{ inputs.STOCK_RELEASE_TAG }}
+      STOCK_ASSET: ${{ inputs.STOCK_ASSET_NAME }}
+      STOCK_SHA: ${{ inputs.STOCK_SHA256 }}
+      TREE_URL: ${{ inputs.DEVICE_TREE }}
+      TREE_BRANCH: ${{ inputs.DEVICE_TREE_BRANCH }}
+    steps:
+    - name: Download Fox-built vendor_boot.img
+      run: |
+        mkdir -p fox stock out
+        gh release download "$FOX_TAG" --repo "$GITHUB_REPOSITORY" --pattern 'vendor_boot.img' --dir fox --clobber
+        ls -l fox
+
+    - name: Download stock vendor_boot.img and verify it
+      run: |
+        gh release download "$STOCK_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$STOCK_ASSET" --dir stock --clobber
+        cp "stock/$STOCK_ASSET" stock/vendor_boot_stock.img
+        SIZE=$(stat -c %s stock/vendor_boot_stock.img)
+        echo "stock size: $SIZE"
+        [ "$SIZE" = "67108864" ] || { echo "::error::stock image must be exactly 67108864 bytes (64 MiB), got $SIZE"; exit 1; }
+        head -c 8 stock/vendor_boot_stock.img | grep -q VNDRBOOT || { echo "::error::not a vendor_boot image"; exit 1; }
+        if [ -n "$STOCK_SHA" ]; then
+          GOT=$(sha256sum stock/vendor_boot_stock.img | cut -d' ' -f1)
+          [ "$GOT" = "$STOCK_SHA" ] || { echo "::error::stock sha256 mismatch: got $GOT"; exit 1; }
+        fi
+        sha256sum stock/vendor_boot_stock.img
+
+    - name: Get the swap tools from the device tree
+      run: |
+        git clone --depth 1 -b "$TREE_BRANCH" "$TREE_URL" tree
+        ls tree/tools/make_vendor_boot.py tree/tools/unpack_vendor_boot.py
+
+    - name: Swap the recovery fragment
+      run: |
+        python3 tree/tools/make_vendor_boot.py stock/vendor_boot_stock.img fox/vendor_boot.img out/vendor_boot_X6885_fox.img
+
+    - name: Verify the result
+      run: |
+        python3 - <<'PY'
+        import sys
+        sys.path.insert(0, 'tree/tools')
+        import make_vendor_boot as m
+        st = open('stock/vendor_boot_stock.img', 'rb').read()
+        fx = open('fox/vendor_boot.img', 'rb').read()
+        out = open('out/vendor_boot_X6885_fox.img', 'rb').read()
+        a, b, c = m.parse(st), m.parse(out), m.parse(fx)
+        pick = next(f for f in c['frags'] if f['type'] == 2 or f['name'] == 'recovery')
+        H = lambda x: (bytes(x['hdr'][:24]), bytes(x['hdr'][28:]))
+        fo, fb = m.avb_footer(st), m.avb_footer(out)
+        checks = {
+          'size is 64 MiB': len(out) == 67108864,
+          'same number of fragments as stock': len(b['frags']) == len(a['frags']) == 2,
+          'platform fragment == stock': b['frags'][0]['data'] == a['frags'][0]['data'],
+          'recovery fragment == Fox build': b['frags'][1]['data'] == pick['data'],
+          'recovery fragment is type 2': b['frags'][1]['type'] == 2,
+          'DTB == stock': b['dtb'] == a['dtb'],
+          'bootconfig == stock': b['bc'] == a['bc'],
+          'header == stock (except ramdisk size)': H(a) == H(b),
+          'AVB footer present': fb is not None,
+          'vbmeta blob == stock': fo is not None and fb is not None and fo['blob'] == fb['blob'],
+          'vbmeta blob readable at footer offset': fb is not None and out[fb['off']:fb['off'] + 4] == b'AVB0',
+        }
+        bad = [k for k, v in checks.items() if not v]
+        for k, v in checks.items(): print(('PASS ' if v else 'FAIL ') + k)
+        if bad:
+            print('::error::verification failed: ' + ', '.join(bad)); sys.exit(1)
+        free = len(out) - 64 - (fb['off'] + fb['size'])
+        print('free space before AVB footer: %d bytes' % free)
+        PY
+
+    - name: Checksums
+      id: sums
+      run: |
+        cd out
+        sha256sum vendor_boot_X6885_fox.img | tee SHA256SUMS.txt
+        {
+          echo "SUM=$(sha256sum vendor_boot_X6885_fox.img | cut -d' ' -f1)"
+        } >> "$GITHUB_ENV"
+        {
+          echo "### Swap result"
+          echo '```'
+          cat SHA256SUMS.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          out/vendor_boot_X6885_fox.img
+          out/SHA256SUMS.txt
+        name: X6885 vendor_boot (Fox recovery fragment swapped into stock) // ${{ github.run_id }}
+        tag_name: swap-${{ github.run_id }}
+        body: |
+          ## vendor_boot for Infinix X6885 - UNTESTED ON DEVICE
+          Stock `vendor_boot.img` with ONLY the `recovery` ramdisk fragment replaced by the OrangeFox build
+          (release `${{ inputs.FOX_RELEASE_TAG }}`). Header, platform fragment, DTB, bootconfig, 64 MiB size and the
+          stock AVB footer/vbmeta blob are unchanged. This image is NOT re-signed.
+
+          sha256: `${{ env.SUM }}`
+
+          Do NOT patch vbmeta / disable verity. Keep your stock vendor_boot.img to restore with fastboot.
+        overwrite_files: true
+        token: ${{ secrets.GITHUB_TOKEN }}
