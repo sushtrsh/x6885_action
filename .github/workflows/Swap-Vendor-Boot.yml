@@ -25,7 +25,7 @@ on:
       DEVICE_TREE:
         description: 'Device tree repo that contains tools/make_vendor_boot.py'
         required: true
-        default: 'https://github.com/sushtrsh/x6885_a16'
+        default: 'https://github.com/sushtrsh/x6885_action'
       DEVICE_TREE_BRANCH:
         description: 'Device tree branch'
         required: true
