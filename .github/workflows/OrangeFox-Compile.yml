@@ -23,6 +23,7 @@ on:
         default: ''
         type: choice
         options:
+          - https://github.com/stephenchaw525-spec/Test
           - https://github.com/sushtrsh/x6885_a16
       DEVICE_TREE_BRANCH:
         description: 'OrangeFox Device Tree Branch'
