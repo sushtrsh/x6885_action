@@ -187,6 +187,13 @@ jobs:
           grep -n -E '^/(etc|apex)[[:space:]]' "$f" || true
         done
 
+        # 5) copySqliteDb: tidak ada di keystore A16 (SEMENTARA: no-op supaya build lanjut;
+        #    ini melewati copy DB keystore -> decrypt FBE di recovery bisa gagal, diperbaiki nanti)
+        echo "--- diag copySqliteDb ---"
+        grep -rn 'copySqliteDb' bootable/recovery system/security 2>/dev/null | head -20 || true
+        sed -i 's/android::keystore::copySqliteDb();/(void)0; \/\* copySqliteDb stubbed (A16) \*\//' bootable/recovery/twrp.cpp
+        grep -n -B3 -A2 'copySqliteDb' bootable/recovery/twrp.cpp || true
+
     - name: Building recovery
       id: build
       run: |
