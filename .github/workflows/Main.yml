@@ -194,6 +194,12 @@ jobs:
         sed -i 's/android::keystore::copySqliteDb();/(void)0; \/\* copySqliteDb stubbed (A16) \*\//' bootable/recovery/twrp.cpp
         grep -n -B3 -A2 'copySqliteDb' bootable/recovery/twrp.cpp || true
 
+        # 6) neverallow vs domain recovery (vold.te) bikin sepolicy.recovery gagal di A16
+        #    -> standar buat build recovery: abaikan neverallow
+        bc=${{ github.event.inputs.DEVICE_PATH }}/BoardConfig.mk
+        grep -q 'SELINUX_IGNORE_NEVERALLOWS' "$bc" || echo 'SELINUX_IGNORE_NEVERALLOWS := true' >> "$bc"
+        grep -n 'SELINUX_IGNORE_NEVERALLOWS' "$bc"
+
     - name: Building recovery
       id: build
       run: |
