@@ -271,10 +271,6 @@ jobs:
         else
           TEXT=$(printf '❌ Build gagal\nDevice: %s\nLog: %s' "$DEVICE" "$RUN_URL")
         fi
-        curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-          --data-urlencode "chat_id=${CHAT_ID}" \
-          --data-urlencode "text=${TEXT}"      TEXT=$(printf '❌ Build gagal\nDevice: %s\nLog: %s' "$DEVICE" "$RUN_URL")
-        fi
-        curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+        curl -sS -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
           --data-urlencode "chat_id=${CHAT_ID}" \
           --data-urlencode "text=${TEXT}"
