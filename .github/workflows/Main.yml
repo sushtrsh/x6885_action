@@ -6,7 +6,7 @@ on:
       SYNC_URL:
         description: 'SYNC_URL'
         required: true
-        default: 'https://github.com/OrangeFox/sync.git'
+        default: 'https://gitlab.com/OrangeFox/sync.git'
       MANIFEST_BRANCH:
         description: 'MANIFEST_BRANCH (OrangeFox branch)'
         required: true
