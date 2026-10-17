@@ -1,0 +1,391 @@
+name: Recovery Build 16.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      SYNC_URL:
+        description: 'SYNC_URL'
+        required: true
+        default: 'https://gitlab.com/OrangeFox/sync.git'
+      MANIFEST_BRANCH:
+        description: 'MANIFEST_BRANCH (OrangeFox branch)'
+        required: true
+        default: '16.0'
+      DEVICE_TREE_URL:
+        description: 'DEVICE_TREE_URL'
+        required: true
+        default: 'https://github.com/sushtrsh/x6885_a16'
+      DEVICE_TREE_BRANCH:
+        description: 'DEVICE_TREE_BRANCH'
+        required: true
+        default: 'Test_bak'
+      DEVICE_PATH:
+        description: 'DEVICE_PATH'
+        required: true
+        default: 'device/infinix/X6885'
+      COMMON_TREE_URL:
+        description: 'COMMON_TREE_URL (if no common tree, leave blank)'
+        required: false
+      COMMON_PATH:
+        description: 'COMMON_PATH (if no common tree, leave blank)'
+        required: false
+      DEVICE_NAME:
+        description: 'DEVICE_NAME'
+        required: true
+        default: 'X6885'
+      MAKEFILE_NAME:
+        description: 'MAKEFILE_NAME (lunch: <MAKEFILE_NAME>-bp2a-eng)'
+        required: true
+        default: 'fox_X6885'
+      BUILD_TARGET:
+        description: 'BUILD_TARGET'
+        required: true
+        default: 'vendorboot'
+      PATCHES:
+        description: 'PATCHES (all | none | contoh: 01 02 07)'
+        required: true
+        default: 'none'
+      USE_CCACHE:
+        description: 'Use ccache (restore + save)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - true
+          - false
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+
+    - name: Check Out
+      uses: actions/checkout@v4
+
+    - name: Cleanup
+      uses: rokibhasansagar/slimhub_actions@main
+
+    - name: Initialize workspace
+      run: |
+        mkdir workspace
+        cd workspace
+        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
+      id: pwd
+
+    - name: Prepare the build environment
+      run: |
+        sudo apt update && sudo apt upgrade -y
+        DEBIAN_FRONTEND=noninteractive sudo apt install -yq \
+            linux-modules-extra-$(uname -r) \
+            git python3 tar aria2 patch ccache
+        git clone https://gitlab.com/OrangeFox/misc/scripts
+        cd scripts
+        sudo bash setup/android_build_env.sh
+        sed -i 's/cd -/cd ../g' setup/install_android_sdk.sh
+        sudo bash setup/install_android_sdk.sh
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Install OpenJDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '11'
+
+    - name: Setup SSH Keys
+      if: ${{ startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@github.com') ||
+          startsWith(github.event.inputs.COMMON_TREE_URL, 'git@github.com') }}
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+          ssh-private-key: |
+            ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Sync OrangeFox sources and minimal manifest
+      run: |
+        cd ${{ steps.pwd.outputs.workspace-folder }}
+        git clone ${{ github.event.inputs.SYNC_URL }}
+        cd sync
+        ./orangefox_sync.sh --branch ${{ github.event.inputs.MANIFEST_BRANCH }} --path ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Clone device tree
+      run: |
+        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+        git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Clone common tree
+      if: |
+        github.event.inputs.COMMON_TREE_URL != null
+        && github.event.inputs.COMMON_PATH != null
+      run: |
+        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+        git clone ${{ github.event.inputs.COMMON_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.COMMON_PATH }}
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Set Swap Space
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 12
+
+    - name: Restore ccache
+      if: github.event.inputs.USE_CCACHE == 'true'
+      id: ccache
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.ccache
+        key: ${{ runner.os }}-orangefox-ccache-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_TREE_BRANCH }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-orangefox-ccache-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_TREE_BRANCH }}-
+          ${{ runner.os }}-orangefox-ccache-${{ github.event.inputs.MANIFEST_BRANCH }}-
+
+    - name: Configure ccache
+      if: github.event.inputs.USE_CCACHE == 'true'
+      run: |
+        mkdir -p "$HOME/.ccache"
+        echo "USE_CCACHE=1" >> "$GITHUB_ENV"
+        echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+        echo "CCACHE_EXEC=$(command -v ccache)" >> "$GITHUB_ENV"
+        ccache -M 10G
+        ccache -z
+        echo "Cache hit: ${{ steps.ccache.outputs.cache-hit }}"
+        ccache -s
+
+    - name: Apply source fixes (A16 / minimal manifest)
+      run: |
+        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+
+        # 1) update_engine vs libsnapshot mismatch (UpdateUsesSnapuserd belum ada di ISnapshotManager)
+        f=system/update_engine/aosp/dynamic_partition_control_android.cc
+        if ! grep -rq 'UpdateUsesSnapuserd' system/core/fs_mgr/libsnapshot/include; then
+          sed -i 's/GetSnapshotManager()->UpdateUsesSnapuserd()/false/' "$f"
+        fi
+        grep -n 'UpdateUsesSnapuserd' "$f" || true
+
+        # 2) libguitwrp butuh system/vold buat fscrypt_policy.h
+        f=bootable/recovery/gui/Android.bp
+        if ! grep -q '"system/vold"' "$f"; then
+          sed -i '0,/"bootable\/recovery\/Fox_ssl\/include",/s//"bootable\/recovery\/Fox_ssl\/include",\n        "system\/vold",/' "$f"
+        fi
+        grep -n -B1 -A1 '"system/vold"' "$f"
+
+        # 3) fallback TW_OZIP_DECRYPT_KEY (dipakai action.cpp, tidak ada default di tree 16.0)
+        for f in $(grep -rl 'TW_OZIP_DECRYPT_KEY' bootable/recovery --include=*.cpp --include=*.hpp --include=*.h); do
+          if ! grep -q 'define TW_OZIP_DECRYPT_KEY' "$f"; then
+            sed -i '1i #ifndef TW_OZIP_DECRYPT_KEY\n#define TW_OZIP_DECRYPT_KEY "0"\n#endif' "$f"
+          fi
+          echo "patched: $f"
+        done
+
+        # 4) sepolicy: /etc dan /apex di file_contexts device bentrok dgn system/sepolicy (A16)
+        #    -> hapus spec generik AOSP, biar label recovery dari device tree yang dipakai
+        for f in $(find system/sepolicy -name file_contexts -path '*/private/*' -not -path '*/prebuilts/*'); do
+          sed -i -E '/^\/etc[[:space:]]+(-.[[:space:]]+)?u:object_r:rootfs:s0/d; /^\/apex[[:space:]]+(-.[[:space:]]+)?u:object_r:apex_mnt_dir:s0/d' "$f"
+          echo "sepolicy fixed: $f"
+          grep -n -E '^/(etc|apex)[[:space:]]' "$f" || true
+        done
+
+        # 5) copySqliteDb: A16 Keystore2 SQLite DB sync
+        echo "--- Patching copySqliteDb for A16 Keystore2 ---"
+        sed -i 's|android::keystore::copySqliteDb();|system("mkdir -p /tmp/misc/keystore \&\& cp -f /data/misc/keystore/persistent.sqlite* /tmp/misc/keystore/ 2>/dev/null \&\& chmod 0600 /tmp/misc/keystore/persistent.sqlite* 2>/dev/null \&\& /system/bin/setprop ctl.restart keystore2");|' bootable/recovery/twrp.cpp
+        grep -n -B2 -A2 'persistent.sqlite' bootable/recovery/twrp.cpp || true
+
+        # 5b) Direct reliable patch for system/vold/Decrypt.cpp (FBE Auth Token to Keystore2)
+        echo "--- Applying FBE Auth Token Fix to system/vold/Decrypt.cpp ---"
+        python3 - << 'PYEOF'
+import os, sys, re
+
+path = "system/vold/Decrypt.cpp"
+if not os.path.isfile(path):
+    print(f"Warning: {path} not found")
+    sys.exit(0)
+
+with open(path, "r", encoding="utf-8", errors="ignore") as f:
+    content = f.read()
+
+# 1. Remove authToken2AidlVec using if present
+content = re.sub(r'using\s+::aidl::android::hardware::security::keymint::km_utils::authToken2AidlVec;\n?', '', content)
+
+# 2. Add null check on keystore
+old_ks = "auto keystore = ks2::IKeystoreService::fromBinder(keystoreBinder);"
+new_ks = """auto keystore = ks2::IKeystoreService::fromBinder(keystoreBinder);
+			if (!keystore) {
+				printf("Could not connect to keystore2 service\\n");
+				return disk_decryption_secret_key;
+			}"""
+if old_ks in content and "if (!keystore)" not in content:
+    content = content.replace(old_ks, new_ks, 1)
+    print("[X6885-Fix] Patched keystore null check")
+
+# 3. Print description on begin_rc failure
+content = content.replace('printf("Begin Operation failed\\n");', 'printf("Begin Operation failed: %s\\n", begin_rc.getDescription().c_str());')
+
+# 4. Declare HardwareAuthToken authToken
+old_decl = "GKResponse gkResponse;"
+new_decl = """GKResponse gkResponse;
+			HardwareAuthToken authToken;"""
+if old_decl in content and "HardwareAuthToken authToken;" not in content:
+    content = content.replace(old_decl, new_decl, 1)
+    print("[X6885-Fix] Patched authToken declaration")
+
+# 5. Direct AIDL token extraction from Gatekeeper
+old_gk_rsp = "gkResponse = GKResponse::ok(authToken2AidlVec(rsp.hardwareAuthToken));"
+new_gk_rsp = """authToken = rsp.hardwareAuthToken;
+					gkResponse = GKResponse::ok({});"""
+if old_gk_rsp in content:
+    content = content.replace(old_gk_rsp, new_gk_rsp)
+    print("[X6885-Fix] Patched direct AIDL token extraction")
+
+# 6. Deliver auth token to IKeystoreAuthorization
+replacement_dispatch = """\
+			if (gkResponse.response_code() != GKResponseCode::OK) {
+				printf("Gatekeeper did not verify the credential\\n");
+				return Free_Return(retval, weaver_key, &pwd);
+			}
+			if (!aidl_gk_device) {
+				const auto& payload = gkResponse.payload();
+				if (payload.size() != sizeof(hw_auth_token_t)) {
+					printf("Gatekeeper HIDL returned an invalid auth token size: %zu\\n", payload.size());
+					return Free_Return(retval, weaver_key, &pwd);
+				}
+				hw_auth_token_t hwAuthToken;
+				memcpy(&hwAuthToken, payload.data(), sizeof(hwAuthToken));
+				authToken.timestamp.milliSeconds = betoh64(hwAuthToken.timestamp);
+				authToken.challenge = hwAuthToken.challenge;
+				authToken.userId = hwAuthToken.user_id;
+				authToken.authenticatorId = hwAuthToken.authenticator_id;
+				authToken.authenticatorType = static_cast<HardwareAuthenticatorType>(
+						betoh32(hwAuthToken.authenticator_type));
+				authToken.mac.assign(&hwAuthToken.hmac[0], &hwAuthToken.hmac[32]);
+			}
+			if (authToken.mac.size() != 32) {
+				printf("Gatekeeper returned an invalid auth token MAC size: %zu\\n", authToken.mac.size());
+				return Free_Return(retval, weaver_key, &pwd);
+			}
+			printf("Gatekeeper auth token ready (authType=%d, MAC bytes=%zu)\\n",
+					static_cast<int32_t>(authToken.authenticatorType), authToken.mac.size());
+			::ndk::SpAIBinder binder(AServiceManager_getService("android.security.authorization"));
+			auto service = aidl::android::security::authorization::IKeystoreAuthorization::fromBinder(binder);
+			if (!service) {
+				printf("Could not connect to keystore authorization service\\n");
+				return Free_Return(retval, weaver_key, &pwd);
+			}
+			auto binder_result = service->addAuthToken(authToken);
+			if (!binder_result.isOk()) {
+				printf("Keystore addAuthToken failed: %s\\n", binder_result.getDescription().c_str());
+				return Free_Return(retval, weaver_key, &pwd);
+			}
+			printf("Gatekeeper auth token accepted by keystore\\n");"""
+
+target_pattern = re.compile(r'if\s*\(\s*gkResponse\.response_code\(\)\s*==\s*GKResponseCode::OK\s*\)\s*\{[\s\S]*?auto\s+binder_result\s*=\s*service->addAuthToken\s*\(\s*authToken\s*\);\s*\}\s*\}')
+if target_pattern.search(content):
+    content = target_pattern.sub(replacement_dispatch, content, count=1)
+    print("[X6885-Fix] Patched auth token delivery to IKeystoreAuthorization via regex")
+elif "Gatekeeper auth token accepted by keystore" in content:
+    print("[X6885-Fix] Auth token delivery already present")
+else:
+    print("[X6885-Fix] Note: Pattern not matched directly, checking if replacement needed")
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(content)
+print("[X6885-Fix] Decrypt.cpp patching step finished.")
+PYEOF
+        grep -n -E "Gatekeeper auth token accepted|persistent\.sqlite" system/vold/Decrypt.cpp bootable/recovery/twrp.cpp || true
+
+        # 6) neverallow vs domain recovery (vold.te) bikin sepolicy.recovery gagal di A16
+        #    -> standar buat build recovery: abaikan neverallow
+        bc=${{ github.event.inputs.DEVICE_PATH }}/BoardConfig.mk
+        grep -q 'SELINUX_IGNORE_NEVERALLOWS' "$bc" || echo 'SELINUX_IGNORE_NEVERALLOWS := true' >> "$bc"
+        grep -n 'SELINUX_IGNORE_NEVERALLOWS' "$bc"
+
+    - name: Dump vendor/recovery (buat cek patch)
+      run: |
+        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/vendor/recovery
+        ls -la
+        grep -n "magiskboot unpack" OrangeFox_A16.sh || true
+
+    - name: Upload OrangeFox_A16.sh
+      uses: actions/upload-artifact@v4
+      with:
+        name: orangefox-vendor-recovery
+        path: |
+          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/vendor/recovery/*.sh
+          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/vendor/recovery/FoxExtras/sbin/foxstart.sh
+        if-no-files-found: warn
+
+    - name: Building recovery
+      id: build
+      run: |
+        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+        set +e
+        # HARUS sebelum envsetup: envsetup ikut nge-source vendorsetup.sh device
+        export X6885_PATCHES="${{ github.event.inputs.PATCHES }}"
+        source build/envsetup.sh
+        # vendorsetup tree ini nge-apply patch ke source OrangeFox & set FOX_* env
+        source ${{ github.event.inputs.DEVICE_PATH }}/vendorsetup.sh
+        export ALLOW_MISSING_DEPENDENCIES=true
+        export FOX_USE_ZSTD_BINARY=1
+        set -e
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-bp2a-eng && make clean && mka adbd ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      continue-on-error: true
+
+    - name: Show ccache statistics
+      if: always() && github.event.inputs.USE_CCACHE == 'true'
+      run: |
+        ccache -s
+        du -sh "$HOME/.ccache" 2>/dev/null || true
+
+    - name: Save ccache
+      if: always() && github.event.inputs.USE_CCACHE == 'true' && steps.ccache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.ccache
+        key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+    - name: Check the output directory before uploading
+      run: |
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/
+        echo
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/
+
+    - name: Upload to Release
+      id: release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox-*.img
+        name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
+          Device: ${{ github.event.inputs.DEVICE_NAME }}
+          Target: ${{ github.event.inputs.BUILD_TARGET }}
+          Tested on 16.3.0.145SP08
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Kirim notifikasi ke Telegram
+      if: always()
+      env:
+        TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        BUILD_STATUS: ${{ steps.build.outcome }}
+        RELEASE_STATUS: ${{ steps.release.outcome }}
+        RELEASE_URL: ${{ steps.release.outputs.url }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        DEVICE: ${{ github.event.inputs.DEVICE_NAME }}
+        MANIFEST: ${{ github.event.inputs.MANIFEST_BRANCH }}
+        TARGET: ${{ github.event.inputs.BUILD_TARGET }}
+      run: |
+        if [ "$BUILD_STATUS" = "success" ] && [ "$RELEASE_STATUS" = "success" ]; then
+          TEXT=$(printf '✅ Build selesai\nDevice: %s\nManifest: %s\nTarget: %s\nRelease: %s' \
+            "$DEVICE" "$MANIFEST" "$TARGET" "$RELEASE_URL")
+        else
+          TEXT=$(printf '❌ Build gagal\nDevice: %s\nLog: %s' "$DEVICE" "$RUN_URL")
+        fi
+        curl -sS -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+          --data-urlencode "chat_id=${CHAT_ID}" \
+          --data-urlencode "text=${TEXT}"
