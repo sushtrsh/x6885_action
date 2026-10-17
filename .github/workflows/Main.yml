@@ -18,7 +18,7 @@ on:
       DEVICE_TREE_BRANCH:
         description: 'DEVICE_TREE_BRANCH'
         required: true
-        default: 'test'
+        default: 'Test_bak'
       DEVICE_PATH:
         description: 'DEVICE_PATH'
         required: true
@@ -187,18 +187,38 @@ jobs:
           grep -n -E '^/(etc|apex)[[:space:]]' "$f" || true
         done
 
-        # 5) copySqliteDb: tidak ada di keystore A16 (SEMENTARA: no-op supaya build lanjut;
-        #    ini melewati copy DB keystore -> decrypt FBE di recovery bisa gagal, diperbaiki nanti)
-        echo "--- diag copySqliteDb ---"
-        grep -rn 'copySqliteDb' bootable/recovery system/security 2>/dev/null | head -20 || true
-        sed -i 's/android::keystore::copySqliteDb();/(void)0; \/\* copySqliteDb stubbed (A16) \*\//' bootable/recovery/twrp.cpp
-        grep -n -B3 -A2 'copySqliteDb' bootable/recovery/twrp.cpp || true
+        # 5) copySqliteDb: A16 Keystore2 SQLite DB sync
+        echo "--- Patching copySqliteDb for A16 Keystore2 ---"
+        sed -i 's|android::keystore::copySqliteDb();|system("mkdir -p /tmp/misc/keystore \&\& cp -f /data/misc/keystore/persistent.sqlite* /tmp/misc/keystore/ 2>/dev/null \&\& chmod 0600 /tmp/misc/keystore/persistent.sqlite* 2>/dev/null \&\& /system/bin/setprop ctl.restart keystore2");|' bootable/recovery/twrp.cpp
+        grep -n -B2 -A2 'persistent.sqlite' bootable/recovery/twrp.cpp || true
+
+        # 5b) Direct reliable patch for system/vold/Decrypt.cpp (FBE Auth Token to Keystore2)
+        echo "--- Applying FBE Auth Token Fix to system/vold/Decrypt.cpp ---"
+        if [ -f "$GITHUB_WORKSPACE/tools/fix_a16_fbe.py" ]; then
+          python3 "$GITHUB_WORKSPACE/tools/fix_a16_fbe.py"
+        fi
+        grep -n -E "Gatekeeper auth token accepted|persistent\.sqlite" system/vold/Decrypt.cpp bootable/recovery/twrp.cpp || true
 
         # 6) neverallow vs domain recovery (vold.te) bikin sepolicy.recovery gagal di A16
         #    -> standar buat build recovery: abaikan neverallow
         bc=${{ github.event.inputs.DEVICE_PATH }}/BoardConfig.mk
         grep -q 'SELINUX_IGNORE_NEVERALLOWS' "$bc" || echo 'SELINUX_IGNORE_NEVERALLOWS := true' >> "$bc"
         grep -n 'SELINUX_IGNORE_NEVERALLOWS' "$bc"
+
+    - name: Dump vendor/recovery (buat cek patch)
+      run: |
+        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/vendor/recovery
+        ls -la
+        grep -n "magiskboot unpack" OrangeFox_A16.sh || true
+
+    - name: Upload OrangeFox_A16.sh
+      uses: actions/upload-artifact@v4
+      with:
+        name: orangefox-vendor-recovery
+        path: |
+          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/vendor/recovery/*.sh
+          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/vendor/recovery/FoxExtras/sbin/foxstart.sh
+        if-no-files-found: warn
 
     - name: Building recovery
       id: build
