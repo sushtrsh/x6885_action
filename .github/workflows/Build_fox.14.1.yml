@@ -11,10 +11,6 @@ on:
         description: 'MANIFEST_BRANCH (OrangeFox branch)'
         required: true
         default: '14.1'
-        type: choice
-        options:
-          - 12.1
-          - 14.1
       DEVICE_TREE_URL:
         description: 'DEVICE_TREE_URL'
         required: true
@@ -22,27 +18,17 @@ on:
       DEVICE_TREE_BRANCH:
         description: 'DEVICE_TREE_BRANCH'
         required: true
-        default: 'test_x6885'
-        type: choice
-        options:
-          - main
-          - test_x6885
+        default: 'main'
       DEVICE_PATH:
         description: 'DEVICE_PATH'
         required: true
         default: 'device/infinix/X6885'
-      COMMON_TREE_URL:
-        description: 'COMMON_TREE_URL (if no common tree, leave blank)'
-        required: false
-      COMMON_PATH:
-        description: 'COMMON_PATH (if no common tree, leave blank)'
-        required: false
       DEVICE_NAME:
         description: 'DEVICE_NAME'
         required: true
         default: 'X6885'
       MAKEFILE_NAME:
-        description: 'MAKEFILE_NAME'
+        description: 'MAKEFILE_NAME (lunch: <MAKEFILE_NAME>-ap2a-eng)'
         required: true
         default: 'fox_X6885'
       BUILD_TARGET:
@@ -52,11 +38,11 @@ on:
       USE_CCACHE:
         description: 'Use ccache (restore + save)'
         required: true
-        default: 'yes'
+        default: 'true'
         type: choice
         options:
-          - 'yes'
-          - 'no'
+          - true
+          - false
 
 jobs:
   build:
@@ -83,7 +69,6 @@ jobs:
       run: |
         sudo apt update && sudo apt upgrade -y
         DEBIAN_FRONTEND=noninteractive sudo apt install -yq \
-            linux-modules-extra-$(uname -r) \
             git python3 tar aria2 patch ccache
         git clone https://gitlab.com/OrangeFox/misc/scripts
         cd scripts
@@ -99,8 +84,7 @@ jobs:
         java-version: '11'
 
     - name: Setup SSH Keys
-      if: ${{ startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@github.com') ||
-          startsWith(github.event.inputs.COMMON_TREE_URL, 'git@github.com') }}
+      if: ${{ startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@github.com') }}
       uses: webfactory/ssh-agent@v0.9.0
       with:
           ssh-private-key: |
@@ -120,15 +104,6 @@ jobs:
         git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
-    - name: Clone common tree
-      if: |
-        github.event.inputs.COMMON_TREE_URL != null
-        && github.event.inputs.COMMON_PATH != null
-      run: |
-        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-        git clone ${{ github.event.inputs.COMMON_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.COMMON_PATH }}
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-
     - name: Set Swap Space
       uses: pierotofy/set-swap-space@master
       with:
@@ -143,7 +118,7 @@ jobs:
         repo sync hardware/google/pixel
 
     - name: Restore ccache
-      if: github.event.inputs.USE_CCACHE == 'yes'
+      if: github.event.inputs.USE_CCACHE == 'true'
       id: ccache
       uses: actions/cache/restore@v4
       with:
@@ -154,7 +129,7 @@ jobs:
           ${{ runner.os }}-orangefox-ccache-${{ github.event.inputs.MANIFEST_BRANCH }}-
 
     - name: Configure ccache
-      if: github.event.inputs.USE_CCACHE == 'yes'
+      if: github.event.inputs.USE_CCACHE == 'true'
       run: |
         mkdir -p "$HOME/.ccache"
         echo "USE_CCACHE=1" >> "$GITHUB_ENV"
@@ -171,7 +146,6 @@ jobs:
         cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
         set +e
         source build/envsetup.sh
-        # vendorsetup tree ini nge-apply patch ke source OrangeFox & set FOX_* env
         source ${{ github.event.inputs.DEVICE_PATH }}/vendorsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         export FOX_USE_ZSTD_BINARY=1
@@ -181,26 +155,28 @@ jobs:
       continue-on-error: true
 
     - name: Show ccache statistics
-      if: always() && github.event.inputs.USE_CCACHE == 'yes'
+      if: always() && github.event.inputs.USE_CCACHE == 'true'
       run: |
         ccache -s
         du -sh "$HOME/.ccache" 2>/dev/null || true
 
     - name: Save ccache
-      if: always() && github.event.inputs.USE_CCACHE == 'yes' && steps.ccache.outputs.cache-hit != 'true'
+      if: always() && github.event.inputs.USE_CCACHE == 'true' && steps.ccache.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
         path: ~/.ccache
         key: ${{ steps.ccache.outputs.cache-primary-key }}
 
     - name: Check the output directory before uploading
+      if: ${{ !cancelled() }}
       run: |
-        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/ || true
         echo
-        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/ || true
 
     - name: Upload to Release
       id: release
+      if: ${{ !cancelled() }}
       uses: softprops/action-gh-release@v2
       with:
         files: |
@@ -211,7 +187,10 @@ jobs:
           Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
           Device: ${{ github.event.inputs.DEVICE_NAME }}
           Target: ${{ github.event.inputs.BUILD_TARGET }}
-          Tested on 16.3.0.145SP08
+          Build: ${{ steps.build.outcome }}
+          Tested on:
+          - 16.3.0.145SP08
+          - 16.3.0.155SP15
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
